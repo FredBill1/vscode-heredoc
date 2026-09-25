@@ -168,6 +168,16 @@ export class ShadowManager implements vscode.Disposable {
     return shadow ? this.lease(shadow) : undefined;
   }
 
+  /** Pin one particular active snapshot while an external diagnostic request runs. */
+  pin(shadow: ShadowDocument): ShadowLease | undefined {
+    if (this.closing || shadow.document.isClosed ||
+      this.byUri.get(shadow.uri.toString()) !== shadow ||
+      (shadow.mode === 'file' && shadow.document.isDirty)) {
+      return undefined;
+    }
+    return this.lease(shadow);
+  }
+
   private lease(shadow: ShadowDocument): ShadowLease {
     this.leases.set(shadow, (this.leases.get(shadow) ?? 0) + 1);
     this.activeLeases++;
@@ -312,6 +322,21 @@ export class ShadowManager implements vscode.Disposable {
     await this.enqueue(source.uri, async () => {
       if (!this.isCurrent(source, expectedVersion, epoch)) return;
       const expected = new Set(regions.map(region => shadowKey(source.uri, region, this.chooseMode(region.languageId, modeFor(region)))));
+      // A TypeScript diagnostic request may have needed a supplemental file:
+      // snapshot while completions still use the primary virtual document.
+      // Reuse that immutable file when another part of the source changes.
+      for (const region of regions) {
+        if (modeFor(region) !== 'auto' ||
+          region.languageId !== 'typescript' && region.languageId !== 'javascript') continue;
+        const key = shadowKey(source.uri, region, 'file');
+        const fallback = this.shadows.get(key);
+        if (fallback && !fallback.document.isClosed && !fallback.document.isDirty &&
+          fallback.content === region.content && fallback.document.getText() === region.content) {
+          fallback.region = region;
+          fallback.sourceVersion = expectedVersion;
+          expected.add(key);
+        }
+      }
       for (const shadow of [...this.shadows.values()]) {
         if (shadow.sourceUri.toString() === source.uri.toString() && !expected.has(shadow.key)) this.retire(shadow);
       }
@@ -320,6 +345,14 @@ export class ShadowManager implements vscode.Disposable {
         if (!this.isCurrent(source, expectedVersion, epoch)) return;
         await this.ensureInternal(source, region, modeFor(region), expectedVersion, epoch, undefined, false);
       }
+    });
+  }
+
+  /** Drop a file used only as an auto-mode diagnostic fallback once it is unnecessary. */
+  async releaseSupplementalFile(source: vscode.Uri, region: HeredocRegion, sourceVersion: number): Promise<void> {
+    await this.enqueue(source, async () => {
+      const shadow = this.shadows.get(shadowKey(source, region, 'file'));
+      if (shadow?.region === region && shadow.sourceVersion === sourceVersion) this.retire(shadow);
     });
   }
 

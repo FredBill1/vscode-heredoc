@@ -13,6 +13,9 @@ const completionLabel = 'HEREDOC_MOCK_COMPLETION';
 const hoverText = 'HEREDOC_MOCK_HOVER';
 const diagnosticText = 'HEREDOC_MOCK_DIAGNOSTIC';
 const eofDiagnosticText = 'HEREDOC_MOCK_EOF';
+const nestedOuterDiagnosticText = 'HEREDOC_OUTER_FALSE_POSITIVE';
+const staleDiagnosticText = 'HEREDOC_STALE_FILE_DIAGNOSTIC';
+const strippedDiagnosticText = 'HEREDOC_STRIPPED_CRLF_DIAGNOSTIC';
 const fixture = [
   'outside_before',
   "bash <<'SH'",
@@ -73,6 +76,11 @@ function hasMockCompletion(items: readonly vscode.CompletionItem[]): boolean {
 function hoverContains(hover: vscode.Hover, text: string): boolean {
   return hover.contents.some(content =>
     typeof content === 'string' ? content.includes(text) : content.value.includes(text));
+}
+
+function hasTabFor(uri: vscode.Uri): boolean {
+  return vscode.window.tabGroups.all.some(group => group.tabs.some(tab =>
+    tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString()));
 }
 
 function definitionTarget(definition: vscode.Location | vscode.LocationLink): {
@@ -178,6 +186,43 @@ export async function run(): Promise<void> {
     const outerBody = new vscode.Position(2, 3);
     const after = new vscode.Position(7, 3);
 
+    console.log('host: a provider can publish diagnostics without a completion request');
+    const innerShadow = await eventually(
+      'inner shadow created proactively',
+      () => vscode.workspace.textDocuments.find(document =>
+        document.uri.scheme === 'heredoc-embedded' && document.languageId === 'plaintext' &&
+        document.getText() === 'alpha\nbeta\n'),
+      value => value !== undefined,
+    );
+    assert.ok(innerShadow);
+    assert.equal(hasTabFor(innerShadow.uri), false, 'hidden shadow never opens an editor tab');
+    const proactiveDiagnostic = new vscode.Diagnostic(
+      new vscode.Range(0, 0, 0, 5), diagnosticText, vscode.DiagnosticSeverity.Warning,
+    );
+    proactiveDiagnostic.source = 'heredoc-mock';
+    const proactiveEof = new vscode.Diagnostic(
+      new vscode.Range(2, 0, 2, 0), eofDiagnosticText, vscode.DiagnosticSeverity.Error,
+    );
+    proactiveEof.source = 'heredoc-mock';
+    mockDiagnostics.set(innerShadow.uri, [proactiveDiagnostic, proactiveEof]);
+    await eventually('proactive diagnostic mapped to inner body',
+      () => vscode.languages.getDiagnostics(source.uri),
+      values => values.some(value => value.message === diagnosticText && value.range.start.line === 3));
+    const outerShadow = await eventually(
+      'outer shell shadow created proactively',
+      () => vscode.workspace.textDocuments.find(document =>
+        document.uri.scheme === 'heredoc-embedded' && document.languageId === 'shellscript' &&
+        document.getText().startsWith("cat <<'MOCK'\nalpha\n")),
+      value => value !== undefined,
+    );
+    assert.ok(outerShadow);
+    mockDiagnostics.set(outerShadow.uri, [new vscode.Diagnostic(
+      new vscode.Range(1, 0, 1, 5), nestedOuterDiagnosticText, vscode.DiagnosticSeverity.Warning,
+    )]);
+    await pause(150);
+    assert.equal(vscode.languages.getDiagnostics(source.uri).some(value => value.message === nestedOuterDiagnosticText),
+      false, 'outer shell diagnostics must not cover the inner heredoc body');
+
     console.log('host: nested shell heredoc forwards completion only inside the inner body');
     const items = await eventually(
       'completion forwarded into inner heredoc',
@@ -232,6 +277,9 @@ export async function run(): Promise<void> {
     const eofDiagnostic = mappedDiagnostics.find(value => value.message === eofDiagnosticText);
     assert.ok(eofDiagnostic, 'EOF diagnostic is retained');
     assert.equal(eofDiagnostic.range.start.line, 4, 'EOF diagnostic stays in body');
+    assert.equal(eofDiagnostic.range.isEmpty, false, 'EOF diagnostic marks a visible body character');
+    assert.equal(mappedDiagnostics.some(value => value.message === nestedOuterDiagnosticText), false,
+      'nested outer diagnostic remains excluded after more provider calls');
 
     console.log('host: configuration changes remove and restore the embedded language immediately');
     await settings.update('rules', [], vscode.ConfigurationTarget.Global);
@@ -253,6 +301,33 @@ export async function run(): Promise<void> {
       () => completionItems(source, inside),
       hasMockCompletion,
     );
+
+    console.log('host: diagnostics map through stripped tabs and CRLF');
+    const strippedSource = await vscode.workspace.openTextDocument({
+      language: 'shellscript', content: "cat <<-'MOCK'\r\n\talpha\r\n\tbeta\r\n\tMOCK\r\n",
+    });
+    const strippedShadow = await eventually(
+      'stripped CRLF shadow created',
+      () => vscode.workspace.textDocuments.find(document =>
+        document.uri.scheme === 'heredoc-embedded' && document.languageId === 'plaintext' &&
+        document.getText() === 'alpha\r\nbeta\r\n'),
+      value => value !== undefined,
+    );
+    assert.ok(strippedShadow);
+    mockDiagnostics.set(strippedShadow.uri, [new vscode.Diagnostic(
+      new vscode.Range(0, 1, 0, 4), strippedDiagnosticText, vscode.DiagnosticSeverity.Error,
+    )]);
+    const strippedDiagnostics = await eventually(
+      'stripped CRLF diagnostic mapped',
+      () => vscode.languages.getDiagnostics(strippedSource.uri),
+      values => values.some(value => value.message === strippedDiagnosticText),
+    );
+    const strippedMapped = strippedDiagnostics.find(value => value.message === strippedDiagnosticText);
+    assert.ok(strippedMapped);
+    assert.equal(strippedMapped.range.start.line, 1);
+    assert.equal(strippedMapped.range.start.character, 2, 'leading TAB is restored');
+    assert.equal(strippedMapped.range.end.character, 5);
+    assert.equal(hasTabFor(strippedShadow.uri), false);
 
     console.log('host: user rule overrides a preset and arbitrary registered languages work');
     await settings.update('rules', [
@@ -293,6 +368,12 @@ export async function run(): Promise<void> {
       document.uri.toString() === fileShadowUri.toString());
     assert.ok(initialShadowDocument && !initialShadowDocument.isDirty, 'initial file shadow is clean');
     const firstStat = await vscode.workspace.fs.stat(fileShadowUri);
+    mockDiagnostics.set(fileShadowUri, [new vscode.Diagnostic(
+      new vscode.Range(0, 0, 0, 5), staleDiagnosticText, vscode.DiagnosticSeverity.Error,
+    )]);
+    await eventually('file snapshot diagnostic appears',
+      () => vscode.languages.getDiagnostics(fileSource.uri),
+      values => values.some(value => value.message === staleDiagnosticText));
     await completionItems(fileSource, new vscode.Position(1, 2));
     const secondStat = await vscode.workspace.fs.stat(fileShadowUri);
     assert.equal(secondStat.mtime, firstStat.mtime, 'unchanged content does not rewrite the file');
@@ -315,6 +396,15 @@ export async function run(): Promise<void> {
       value => value !== undefined,
     );
     assert.ok(updatedShadowUri);
+    await eventually('old file snapshot diagnostic is removed after edits',
+      () => vscode.languages.getDiagnostics(fileSource.uri),
+      values => !values.some(value => value.message === staleDiagnosticText));
+    mockDiagnostics.set(fileShadowUri, [new vscode.Diagnostic(
+      new vscode.Range(1, 0, 1, 4), staleDiagnosticText, vscode.DiagnosticSeverity.Error,
+    )]);
+    await pause(150);
+    assert.equal(vscode.languages.getDiagnostics(fileSource.uri).some(value => value.message === staleDiagnosticText),
+      false, 'late diagnostics from a retired URI cannot reappear in the source');
     if (await exists(fileShadowUri)) {
       assert.equal(Buffer.from(await vscode.workspace.fs.readFile(fileShadowUri)).toString('utf8'),
         'alpha\nbeta\n', 'older snapshot is never edited');
@@ -369,6 +459,36 @@ export async function run(): Promise<void> {
       assert.ok(second);
       assert.notEqual(first.uri.toString(), second.uri.toString(), 'sessions cannot share a file path');
       await secondManager.shutdown();
+
+      console.log('host: unchanged TypeScript diagnostic fallback reuses its file snapshot');
+      const fallbackSource = await vscode.workspace.openTextDocument({
+        language: 'shellscript', content: "cat <<'TS'\nconst value: = 1;\nTS\n",
+      });
+      const fallbackManager = new ShadowManager(sessionContext, sessionOutput);
+      try {
+        const originalRegion = parseHeredocs(fallbackSource.getText(), () => 'typescript')[0];
+        assert.ok(originalRegion);
+        await fallbackManager.reconcile(fallbackSource, [originalRegion], () => 'auto');
+        const fallback = await fallbackManager.ensure(fallbackSource, originalRegion, 'file');
+        assert.ok(fallback);
+        const before = await vscode.workspace.fs.stat(fallback.uri);
+        const unrelatedEdit = new vscode.WorkspaceEdit();
+        unrelatedEdit.insert(fallbackSource.uri, fallbackSource.positionAt(fallbackSource.getText().length), 'echo done\n');
+        assert.ok(await vscode.workspace.applyEdit(unrelatedEdit));
+        const nextRegion = parseHeredocs(fallbackSource.getText(), () => 'typescript')[0];
+        assert.ok(nextRegion);
+        await fallbackManager.reconcile(fallbackSource, [nextRegion], () => 'auto');
+        const retained = fallbackManager.listForSource(fallbackSource.uri).find(item => item.mode === 'file');
+        assert.ok(retained);
+        assert.equal(retained?.uri.toString(), fallback.uri.toString());
+        assert.equal(retained.sourceVersion, fallbackSource.version);
+        assert.equal((await vscode.workspace.fs.stat(fallback.uri)).mtime, before.mtime,
+          'unchanged fallback content does not rewrite a file');
+        await fallbackManager.releaseSupplementalFile(fallbackSource.uri, nextRegion, fallbackSource.version);
+        await eventually('unneeded fallback file removed', () => exists(fallback.uri), value => !value);
+      } finally {
+        await fallbackManager.shutdown();
+      }
     } finally {
       sessionOutput.dispose();
       await fs.rm(sessionRoot, { recursive: true, force: true });

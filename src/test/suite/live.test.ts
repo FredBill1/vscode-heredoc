@@ -5,6 +5,11 @@ import { ThemeLoader } from '../../theme';
 
 function wait(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)); }
 
+function textTabUris(): string[] {
+  return vscode.window.tabGroups.all.flatMap(group => group.tabs.flatMap(tab =>
+    tab.input instanceof vscode.TabInputText ? [tab.input.uri.toString()] : []));
+}
+
 async function until<T>(read: () => Promise<T>, accept: (value: T) => boolean, ms = 12_000): Promise<T> {
   const start = Date.now();
   let value = await read();
@@ -27,6 +32,7 @@ async function probe(
     language: 'shellscript', content: `cat <<'${label}'\n${body}\n${label}\n`,
   });
   await vscode.window.showTextDocument(source);
+  const tabsBeforeShadow = textTabUris();
   const shadow = await until(
     async () => vscode.workspace.textDocuments.find(document =>
       document.uri.toString() !== source.uri.toString() &&
@@ -35,6 +41,8 @@ async function probe(
   );
   assert.ok(shadow, `${label} shadow document was created`);
   assert.equal(shadow.uri.scheme, scheme, `${label} uses ${scheme}: shadow`);
+  assert.deepEqual(textTabUris(), tabsBeforeShadow, `${label} shadow does not occupy an editor tab`);
+  assert.equal(textTabUris().includes(shadow.uri.toString()), false);
   if (scheme === 'file') {
     assert.equal(shadow.isDirty, false, `${label} file snapshot stays clean`);
   }
@@ -91,6 +99,72 @@ async function probe(
     diagnostics: vscode.languages.getDiagnostics(shadow.uri).map(item => item.message),
     targetActive: vscode.extensions.getExtension(targets[label])?.isActive,
   }));
+}
+
+async function syntaxDiagnosticProbe(
+  label: 'TS' | 'JS' | 'YAML' | 'PY' | 'SH',
+  language: string,
+  invalidBody: string,
+  validBody: string,
+  required: boolean,
+): Promise<void> {
+  const source = await vscode.workspace.openTextDocument({
+    language: 'shellscript', content: `cat <<'${label}'\n${invalidBody}\n${label}\n`,
+  });
+  await vscode.window.showTextDocument(source);
+  const tabsBeforeShadow = textTabUris();
+  const shadow = await until(
+    async () => vscode.workspace.textDocuments.find(document =>
+      document.uri.toString() !== source.uri.toString() && document.languageId === language &&
+      document.getText() === `${invalidBody}\n`),
+    value => value !== undefined,
+  );
+  assert.ok(shadow, `${label} invalid-code shadow document was created`);
+  assert.deepEqual(textTabUris(), tabsBeforeShadow, `${label} diagnostics do not open a hidden tab`);
+  if (shadow.uri.scheme === 'file') {
+    assert.equal(shadow.isDirty, false, `${label} snapshot stays clean while diagnostics run`);
+  }
+
+  const bodyEndLine = 1 + invalidBody.split('\n').length;
+  const isBodyError = (value: vscode.Diagnostic): boolean =>
+    value.severity === vscode.DiagnosticSeverity.Error &&
+    value.range.start.line >= 1 && value.range.start.line < bodyEndLine;
+  const diagnostics = await until(async () => vscode.languages.getDiagnostics(source.uri),
+    values => values.some(isBodyError), required ? 30_000 : 5_000);
+  const shadowDiagnostics = vscode.languages.getDiagnostics(shadow.uri);
+  console.log('LIVE SYNTAX', JSON.stringify({
+    label,
+    shadowUri: shadow.uri.toString(),
+    shadowDiagnostics: shadowDiagnostics.map(value => [value.message, value.range.start.line, value.range.start.character]),
+    sourceDiagnostics: diagnostics.map(value => [value.message, value.range.start.line, value.range.start.character]),
+  }));
+  if (required) {
+    assert.ok(diagnostics.some(isBodyError), `${label} syntax error is reported in the heredoc body`);
+    const bodyErrors = diagnostics.filter(isBodyError);
+    assert.ok(bodyErrors.every(value => !value.range.isEmpty),
+      `${label} syntax errors have a visible range`);
+    const keys = bodyErrors.map(value => [
+      value.message, value.code ?? '', value.range.start.line, value.range.start.character,
+      value.range.end.line, value.range.end.character,
+    ].join('\u0000'));
+    assert.equal(new Set(keys).size, keys.length, `${label} passive and requested diagnostics do not duplicate`);
+  } else if (shadowDiagnostics.some(value => value.severity === vscode.DiagnosticSeverity.Error)) {
+    assert.ok(diagnostics.some(isBodyError), `${label} published hidden-document errors map into the source`);
+  }
+
+  if (required) {
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(source.uri, new vscode.Range(1, 0, bodyEndLine, 0), `${validBody}\n`);
+    assert.ok(await vscode.workspace.applyEdit(edit), `${label} source correction succeeds`);
+    const cleared = await until(async () => vscode.languages.getDiagnostics(source.uri),
+      values => !values.some(isBodyError), 30_000);
+    assert.equal(cleared.some(isBodyError), false, `${label} syntax diagnostic clears after correction`);
+    assert.equal(textTabUris().some(uri => uri === shadow.uri.toString()), false,
+      `${label} diagnostics never reveal a shadow tab`);
+    assert.ok(vscode.workspace.textDocuments.filter(document =>
+      document.uri.scheme === 'file' && document.uri.path.includes('/shadow/')).every(document => !document.isDirty),
+    `${label} file snapshots remain clean after correction`);
+  }
 }
 
 async function inspectLiveThemes(): Promise<void> {
@@ -167,6 +241,11 @@ export async function run(): Promise<void> {
     ], vscode.ConfigurationTarget.Global);
     await probe('YAMLFILE', 'yaml', 'fileprobe: [1, 2', 0, 13, 'file');
     await probe('SH', 'shellscript', 'echo hel', 0, 8, 'file');
+    await syntaxDiagnosticProbe('TS', 'typescript', 'const value: = 1;', 'const value: number = 1;', true);
+    await syntaxDiagnosticProbe('JS', 'javascript', 'const value = ;', 'const value = 1;', true);
+    await syntaxDiagnosticProbe('YAML', 'yaml', 'items: [1, 2', 'items: [1, 2]', true);
+    await syntaxDiagnosticProbe('PY', 'python', 'def broken(:\n    pass', 'def broken():\n    pass', false);
+    await syntaxDiagnosticProbe('SH', 'shellscript', 'if then\n  echo broken\nfi', 'if true; then\n  echo fixed\nfi', false);
     await inspectLiveThemes();
   } finally {
     await settings.update('rules', previousRules, vscode.ConfigurationTarget.Global);

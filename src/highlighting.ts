@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import * as textmate from 'vscode-textmate';
 import * as oniguruma from 'vscode-oniguruma';
 import { HeredocRegion } from './parser';
-import { ResolvedTheme, semanticAppearance, ThemeLoader, TokenAppearance } from './theme';
+import { ResolvedTheme, resolveSemanticAppearance, ThemeLoader, TokenAppearance } from './theme';
 
 interface GrammarLocation {
   readonly extension: vscode.Extension<unknown>;
@@ -13,6 +13,7 @@ interface GrammarLocation {
 
 interface HighlightRequest {
   readonly regions: HeredocRegion[];
+  readonly sourceVersion: number;
 }
 
 interface OffsetInterval {
@@ -25,11 +26,31 @@ interface DecorationStyle extends TokenAppearance {
   readonly foreground?: string;
 }
 
-interface SemanticSegment {
-  readonly region: HeredocRegion;
+interface StyledSegment {
   readonly start: number;
   readonly end: number;
   readonly style: DecorationStyle;
+}
+
+interface SemanticSnapshot {
+  readonly legend: vscode.SemanticTokensLegend;
+  readonly data: Uint32Array;
+}
+
+interface SemanticCacheEntry {
+  readonly content: string;
+  readonly result: Promise<SemanticSnapshot | undefined>;
+}
+
+interface SemanticRender {
+  readonly segments: StyledSegment[];
+  readonly retry: boolean;
+}
+
+interface SemanticRetry {
+  readonly sourceVersion: number;
+  attempts: number;
+  timer?: NodeJS.Timeout;
 }
 
 const FONT_STYLE_OFFSET = 11;
@@ -59,6 +80,27 @@ const DEFAULT_SEMANTIC_SCOPES: Readonly<Record<string, readonly string[]>> = {
   event: ['variable.other.event'],
 };
 
+function semanticScopeScore(
+  selector: string, type: string, modifiers: ReadonlySet<string>, languageId: string,
+  supertypes: ReadonlyMap<string, string>,
+): number {
+  const match = /^([^.:]+)((?:\.[^.:]+)*)(?::(.+))?$/.exec(selector);
+  if (!match || (match[3] && match[3] !== languageId)) { return -1; }
+  const required = match[2].split('.').filter(Boolean);
+  if (required.some(modifier => !modifiers.has(modifier))) { return -1; }
+  let typeScore = match[1] === '*' ? 0 : -1;
+  let current = type;
+  const visited = new Set<string>();
+  for (let depth = 0; !visited.has(current); depth++) {
+    if (match[1] === current) { typeScore = 100 - depth; break; }
+    visited.add(current);
+    const parent = supertypes.get(current) ?? (current === 'member' ? 'method' : undefined);
+    if (!parent) { break; }
+    current = parent;
+  }
+  return typeScore < 0 ? -1 : typeScore + required.length * 100 + (match[3] ? 10 : 0);
+}
+
 function appearanceFromMetadata(metadata: number, colorMap: readonly string[], hasBaseForeground: boolean): DecorationStyle {
   const foregroundId = (metadata >>> FOREGROUND_OFFSET) & FOREGROUND_MASK;
   const fontStyle = (metadata >>> FONT_STYLE_OFFSET) & 0xf;
@@ -70,6 +112,34 @@ function appearanceFromMetadata(metadata: number, colorMap: readonly string[], h
     underline: Boolean(fontStyle & 4),
     strikethrough: Boolean(fontStyle & 8),
   };
+}
+
+function* mergeSegments(
+  lexical: readonly StyledSegment[], semantic: readonly StyledSegment[],
+): Generator<StyledSegment> {
+  if (!semantic.length) { yield* lexical; return; }
+  const sorted = [...semantic].sort((a, b) => a.start - b.start || a.end - b.end);
+  let index = 0;
+  for (const token of lexical) {
+    let cursor = token.start;
+    while (index < sorted.length && sorted[index].end <= cursor) { index++; }
+    let next = index;
+    while (next < sorted.length && sorted[next].start < token.end) {
+      const overlay = sorted[next];
+      if (overlay.start > cursor) {
+        yield { start: cursor, end: Math.min(overlay.start, token.end), style: token.style };
+      }
+      const start = Math.max(cursor, overlay.start);
+      const end = Math.min(token.end, overlay.end);
+      if (start < end) {
+        yield { start, end, style: { ...token.style, ...overlay.style } };
+        cursor = end;
+      }
+      if (cursor >= token.end) { break; }
+      next++;
+    }
+    if (cursor < token.end) { yield { start: cursor, end: token.end, style: token.style }; }
+  }
 }
 
 let wasmReady: Promise<void> | undefined;
@@ -92,6 +162,8 @@ async function readyOniguruma(): Promise<void> {
 export class GrammarLibrary {
   private byScope = new Map<string, GrammarLocation>();
   private byLanguage = new Map<string, string>();
+  private injections = new Map<string, string[]>();
+  private semanticSupertypes = new Map<string, string>();
   private registry: textmate.Registry | undefined;
   private grammarPromises = new Map<string, Promise<textmate.IGrammar | null>>();
   private semanticStylePromises = new Map<string, Promise<DecorationStyle | undefined>>();
@@ -106,6 +178,8 @@ export class GrammarLibrary {
   refresh(): void {
     this.byScope.clear();
     this.byLanguage.clear();
+    this.injections.clear();
+    this.semanticSupertypes.clear();
     this.registry = undefined;
     this.grammarPromises.clear();
     this.semanticStylePromises.clear();
@@ -126,8 +200,25 @@ export class GrammarLibrary {
           scopeName: contribution.scopeName,
         };
         this.byScope.set(location.scopeName, location);
+        if (Array.isArray(contribution.injectTo)) {
+          for (const target of contribution.injectTo) {
+            if (typeof target !== 'string') { continue; }
+            const scopes = this.injections.get(target) ?? [];
+            if (!scopes.includes(location.scopeName)) { scopes.push(location.scopeName); }
+            this.injections.set(target, scopes);
+          }
+        }
         if (typeof contribution.language === 'string' && !this.byLanguage.has(contribution.language)) {
           this.byLanguage.set(contribution.language, location.scopeName);
+        }
+      }
+    }
+    for (const extension of vscode.extensions.all) {
+      const types = extension.packageJSON?.contributes?.semanticTokenTypes;
+      if (!Array.isArray(types)) { continue; }
+      for (const type of types) {
+        if (typeof type?.id === 'string' && typeof type?.superType === 'string') {
+          this.semanticSupertypes.set(type.id, type.superType);
         }
       }
     }
@@ -161,21 +252,40 @@ export class GrammarLibrary {
   async semanticAppearance(
     languageId: string, type: string, modifiers: ReadonlySet<string>, hasBaseForeground: boolean,
   ): Promise<DecorationStyle | undefined> {
-    const selectors = [
-      `${type}.readonly.defaultLibrary`, `${type}.readonly`, `${type}.defaultLibrary`, type,
-    ].filter(selector => {
-      const required = selector.slice(type.length).split('.').filter(Boolean);
-      return required.every(modifier => modifiers.has(modifier));
-    });
-    for (const selector of selectors) {
-      const scopes = this.semanticScopes.get(languageId)?.get(selector) ??
-        this.semanticScopes.get('*')?.get(selector) ?? DEFAULT_SEMANTIC_SCOPES[selector] ?? [];
-      for (const scope of scopes) {
+    const candidates: { score: number; scopes: readonly string[] }[] = [];
+    const collect = (mapping: ReadonlyMap<string, readonly string[]> | Readonly<Record<string, readonly string[]>>,
+      sourcePriority: number): void => {
+      const entries = mapping instanceof Map ? mapping.entries() : Object.entries(mapping);
+      for (const [selector, scopes] of entries) {
+        const score = semanticScopeScore(selector, type, modifiers, languageId, this.semanticSupertypes);
+        if (score >= 0) { candidates.push({ score: score * 10 + sourcePriority, scopes }); }
+      }
+    };
+    collect(this.semanticScopes.get(languageId) ?? new Map(), 3);
+    collect(this.semanticScopes.get('*') ?? new Map(), 2);
+    collect(DEFAULT_SEMANTIC_SCOPES, 1);
+    candidates.sort((a, b) => b.score - a.score);
+    const merged: {
+      foreground?: string;
+      bold?: boolean;
+      italic?: boolean;
+      underline?: boolean;
+      strikethrough?: boolean;
+    } = {};
+    for (const candidate of candidates) {
+      for (const scope of candidate.scopes) {
         const appearance = await this.appearanceForScope(languageId, scope, hasBaseForeground);
-        if (appearance) { return appearance; }
+        if (!appearance) { continue; }
+        for (const property of [
+          'foreground', 'bold', 'italic', 'underline', 'strikethrough',
+        ] as const) {
+          if (merged[property] === undefined && appearance[property] !== undefined) {
+            (merged as Record<string, string | boolean>)[property] = appearance[property]!;
+          }
+        }
       }
     }
-    return undefined;
+    return Object.keys(merged).length ? merged : undefined;
   }
 
   private async appearanceForScope(
@@ -270,6 +380,7 @@ export class GrammarLibrary {
               return null;
             }
           },
+          getInjections: (requestedScope: string) => this.injections.get(requestedScope) ?? [],
         });
       }
       return await this.registry.loadGrammar(scope);
@@ -309,9 +420,11 @@ export class HeredocHighlighter implements vscode.Disposable {
   private readonly painted = new Map<vscode.TextEditor, Set<string>>();
   private readonly requests = new Map<vscode.TextEditor, HighlightRequest>();
   private readonly versions = new WeakMap<vscode.TextEditor, number>();
+  private readonly semanticCache = new Map<string, SemanticCacheEntry>();
+  private readonly semanticUrisBySource = new Map<string, Set<string>>();
+  private readonly semanticRetries = new Map<vscode.TextEditor, SemanticRetry>();
   private readonly extensionListener: vscode.Disposable;
   private readonly editorListener: vscode.Disposable;
-  private readonly viewportListener: vscode.Disposable;
   private readonly themeListener: vscode.Disposable;
   private readonly configurationListener: vscode.Disposable;
   private themePromise: Promise<ResolvedTheme> | undefined;
@@ -328,17 +441,14 @@ export class HeredocHighlighter implements vscode.Disposable {
     this.themes = new ThemeLoader(output);
     this.extensionListener = vscode.extensions.onDidChange(() => {
       this.grammars.refresh();
+      this.semanticCache.clear();
+      this.semanticUrisBySource.clear();
+      for (const editor of this.semanticRetries.keys()) { this.clearSemanticRetry(editor); }
       this.invalidateTheme();
     });
     this.editorListener = vscode.window.onDidChangeVisibleTextEditors(editors => {
       for (const editor of new Set([...this.requests.keys(), ...this.painted.keys()])) {
         if (!editors.includes(editor)) { this.clear(editor); }
-      }
-    });
-    this.viewportListener = vscode.window.onDidChangeTextEditorVisibleRanges(event => {
-      const request = this.requests.get(event.textEditor);
-      if (request) {
-        void this.update(event.textEditor, request.regions);
       }
     });
     this.themeListener = vscode.window.onDidChangeActiveColorTheme(() => this.invalidateTheme());
@@ -353,97 +463,141 @@ export class HeredocHighlighter implements vscode.Disposable {
     });
   }
 
-  /** Paint only body characters; sourceOffsets maps token boundaries to the source document. */
+  /** Pre-render every body, including lines outside the viewport. */
   async update(editor: vscode.TextEditor, regions: HeredocRegion[]): Promise<void> {
     if (this.disposed) { return; }
+    const oldRequest = this.requests.get(editor);
+    if (oldRequest && oldRequest.sourceVersion !== editor.document.version) {
+      this.forgetSemanticSource(editor.document.uri.toString());
+    }
     const version = (this.versions.get(editor) ?? 0) + 1;
     this.versions.set(editor, version);
-    this.requests.set(editor, { regions });
-
-    const byStyle = new Map<string, vscode.Range[]>();
+    this.requests.set(editor, { regions, sourceVersion: editor.document.version });
+    const retry = this.semanticRetries.get(editor);
+    if (retry && retry.sourceVersion !== editor.document.version) {
+      if (retry.timer) { clearTimeout(retry.timer); }
+      this.semanticRetries.delete(editor);
+    }
+    if (!regions.length) {
+      this.forgetSemanticSource(editor.document.uri.toString());
+      this.clearSemanticRetry(editor);
+      this.paint(editor, new Map(), version);
+      return;
+    }
     const theme = await this.currentTheme();
-    if (this.versions.get(editor) !== version || this.disposed) { return; }
-
-    const visible = editor.visibleRanges
-      .map(range => ({
-        start: editor.document.offsetAt(range.start),
-        end: editor.document.offsetAt(range.end),
-      }))
-      .filter(range => range.end > range.start)
-      .sort((a, b) => a.start - b.start);
-    const viewportStart = visible[0]?.start ?? Number.POSITIVE_INFINITY;
-    const viewportEnd = visible.reduce((end, range) => Math.max(end, range.end), Number.NEGATIVE_INFINITY);
-
+    if (!this.isCurrent(editor, version)) { return; }
+    const lexical = new Map<HeredocRegion, StyledSegment[]>();
     for (const region of regions) {
-      if (this.versions.get(editor) !== version) { return; }
-      if (region.bodyEnd <= viewportStart || region.bodyStart >= viewportEnd) { continue; }
-      const grammar = await this.grammars.forLanguage(region.languageId);
-      if (this.versions.get(editor) !== version) { return; }
-      const exclusions = mergedExclusions(region, regions);
-      let ruleStack: textmate.StateStack | null = null;
-      let lineStart = 0;
-      const content = region.content;
+      const segments = await this.lexicalSegments(region, theme, () => this.isCurrent(editor, version));
+      if (!segments || !this.isCurrent(editor, version)) { return; }
+      lexical.set(region, segments);
+    }
+    const previous = this.painted.get(editor);
+    if (!previous?.size) {
+      // Give a newly opened editor full-document TextMate colors promptly. The
+      // later semantic result is assembled as one replacement, never on scroll.
+      const lexicalRanges = await this.rangesFor(editor, regions, lexical, new Map(), version);
+      if (!lexicalRanges) { return; }
+      this.paint(editor, lexicalRanges, version);
+    }
+    if (!this.semanticUriForRegion) {
+      if (previous?.size) {
+        const ranges = await this.rangesFor(editor, regions, lexical, new Map(), version);
+        if (ranges) { this.paint(editor, ranges, version); }
+      }
+      return;
+    }
+    const renders = await Promise.all(regions.map(region =>
+      this.semanticSegments(editor.document, region, theme, () => this.isCurrent(editor, version))));
+    if (!this.isCurrent(editor, version)) { return; }
+    const semantic = new Map(regions.map((region, index) => [region, renders[index].segments]));
+    const byStyle = await this.rangesFor(editor, regions, lexical, semantic, version);
+    if (!byStyle) { return; }
+    this.paint(editor, byStyle, version);
+    if (renders.some(render => render.retry)) {
+      this.scheduleSemanticRetry(editor);
+    } else {
+      this.clearSemanticRetry(editor);
+    }
+  }
 
-      while (lineStart < content.length) {
-        let lineEnd = lineStart;
-        while (lineEnd < content.length && content[lineEnd] !== '\n' && content[lineEnd] !== '\r') {
-          lineEnd++;
-        }
-        const line = content.slice(lineStart, lineEnd);
-        const paint = (from: number, to: number, style: DecorationStyle): void =>
-          this.addRanges(byStyle, style, region, lineStart + from, lineStart + to,
-            editor, visible, exclusions);
+  private isCurrent(editor: vscode.TextEditor, version: number): boolean {
+    return !this.disposed && !editor.document.isClosed && this.versions.get(editor) === version &&
+      this.requests.get(editor)?.sourceVersion === editor.document.version;
+  }
 
-        if (line.length > 0) {
-          if (grammar && line.length <= 20000) {
-            try {
-              const result = grammar.tokenizeLine2(line, ruleStack, 50);
-              if (result.stoppedEarly) {
-                paint(0, line.length, { foreground: '@editor.foreground' });
-                ruleStack = null;
-              } else {
-                ruleStack = result.ruleStack;
-                const colors = this.grammars.getColorMap();
-                for (let index = 0; index < result.tokens.length; index += 2) {
-                  const start = result.tokens[index];
-                  const end = index + 2 < result.tokens.length ? result.tokens[index + 2] : line.length;
-                  const metadata = result.tokens[index + 1];
-                  paint(start, Math.min(end, line.length),
-                    appearanceFromMetadata(metadata, colors, theme.hasBaseForeground));
-                }
-              }
-            } catch (error) {
-              this.output.appendLine(`Cannot tokenize ${region.languageId}: ${String(error)}`);
-              paint(0, line.length, { foreground: '@editor.foreground' });
+  private async lexicalSegments(
+    region: HeredocRegion, theme: ResolvedTheme, isCurrent: () => boolean,
+  ): Promise<StyledSegment[] | undefined> {
+    const grammar = await this.grammars.forLanguage(region.languageId);
+    if (!isCurrent()) { return undefined; }
+    const segments: StyledSegment[] = [];
+    let ruleStack: textmate.StateStack | null = null;
+    let lineStart = 0;
+    let processed = 0;
+    const content = region.content;
+    while (lineStart < content.length) {
+      if (++processed % 200 === 0) {
+        await new Promise<void>(resolve => setImmediate(resolve));
+        if (!isCurrent()) { return undefined; }
+      }
+      let lineEnd = lineStart;
+      while (lineEnd < content.length && content[lineEnd] !== '\n' && content[lineEnd] !== '\r') { lineEnd++; }
+      const line = content.slice(lineStart, lineEnd);
+      const add = (from: number, to: number, style: DecorationStyle): void => {
+        if (from < to) { segments.push({ start: lineStart + from, end: lineStart + to, style }); }
+      };
+      if (line.length > 0) {
+        if (grammar && line.length <= 20000) {
+          try {
+            const result = grammar.tokenizeLine2(line, ruleStack, 50);
+            if (result.stoppedEarly) {
+              add(0, line.length, { foreground: '@editor.foreground' });
               ruleStack = null;
+            } else {
+              ruleStack = result.ruleStack;
+              const colors = this.grammars.getColorMap();
+              for (let index = 0; index < result.tokens.length; index += 2) {
+                const start = result.tokens[index];
+                const end = index + 2 < result.tokens.length ? result.tokens[index + 2] : line.length;
+                add(start, Math.min(end, line.length),
+                  appearanceFromMetadata(result.tokens[index + 1], colors, theme.hasBaseForeground));
+              }
             }
-          } else {
-            paint(0, line.length, { foreground: '@editor.foreground' });
+          } catch (error) {
+            this.output.appendLine(`Cannot tokenize ${region.languageId}: ${String(error)}`);
+            add(0, line.length, { foreground: '@editor.foreground' });
             ruleStack = null;
           }
+        } else {
+          add(0, line.length, { foreground: '@editor.foreground' });
+          ruleStack = null;
         }
-        if (lineEnd >= content.length) { break; }
-        lineStart = lineEnd + (content[lineEnd] === '\r' && content[lineEnd + 1] === '\n' ? 2 : 1);
+      }
+      if (lineEnd >= content.length) { break; }
+      lineStart = lineEnd + (content[lineEnd] === '\r' && content[lineEnd + 1] === '\n' ? 2 : 1);
+    }
+    return segments;
+  }
+
+  private async rangesFor(
+    editor: vscode.TextEditor, regions: readonly HeredocRegion[],
+    lexical: ReadonlyMap<HeredocRegion, readonly StyledSegment[]>,
+    semantic: ReadonlyMap<HeredocRegion, readonly StyledSegment[]>, version: number,
+  ): Promise<Map<string, vscode.Range[]> | undefined> {
+    const byStyle = new Map<string, vscode.Range[]>();
+    let processed = 0;
+    for (const region of regions) {
+      const exclusions = mergedExclusions(region, regions);
+      for (const segment of mergeSegments(lexical.get(region) ?? [], semantic.get(region) ?? [])) {
+        if (++processed % 5000 === 0) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          if (!this.isCurrent(editor, version)) { return undefined; }
+        }
+        this.addRanges(byStyle, segment.style, region, segment.start, segment.end, editor, exclusions);
       }
     }
-
-    this.paint(editor, byStyle, version);
-
-    // Semantic providers may start after the TextMate paint. Keep the lexical
-    // colors visible while asking the already-open embedded document for tokens.
-    if (this.semanticUriForRegion) {
-      const visibleRegions = regions.filter(region =>
-        region.bodyEnd > viewportStart && region.bodyStart < viewportEnd);
-      const segments = await Promise.all(visibleRegions.map(region =>
-        this.semanticSegments(editor.document, region, theme)));
-      if (this.versions.get(editor) !== version || this.disposed) { return; }
-      for (const segment of segments.flat()) {
-        const exclusions = mergedExclusions(segment.region, regions);
-        this.addRanges(byStyle, segment.style, segment.region, segment.start, segment.end,
-          editor, visible, exclusions);
-      }
-      this.paint(editor, byStyle, version);
-    }
+    return this.isCurrent(editor, version) ? byStyle : undefined;
   }
 
   private async currentTheme(): Promise<ResolvedTheme> {
@@ -468,7 +622,7 @@ export class HeredocHighlighter implements vscode.Disposable {
   private addRanges(
     byStyle: Map<string, vscode.Range[]>, style: DecorationStyle,
     region: HeredocRegion, localStart: number, localEnd: number,
-    editor: vscode.TextEditor, visible: readonly OffsetInterval[], exclusions: readonly OffsetInterval[],
+    editor: vscode.TextEditor, exclusions: readonly OffsetInterval[],
   ): void {
     if (localStart >= localEnd) { return; }
     const start = region.sourceOffsets[localStart];
@@ -476,61 +630,107 @@ export class HeredocHighlighter implements vscode.Disposable {
     if (!Number.isInteger(start) || !Number.isInteger(end) || end <= start) { return; }
     const key = JSON.stringify(style);
     this.styles.set(key, style);
-    const addVisible = (from: number, to: number): void => {
-      for (const viewport of visible) {
-        if (viewport.end <= from) { continue; }
-        if (viewport.start >= to) { break; }
-        const clippedStart = Math.max(from, viewport.start);
-        const clippedEnd = Math.min(to, viewport.end);
-        if (clippedStart < clippedEnd) {
-          let ranges = byStyle.get(key);
-          if (!ranges) { ranges = []; byStyle.set(key, ranges); }
-          ranges.push(new vscode.Range(editor.document.positionAt(clippedStart),
-            editor.document.positionAt(clippedEnd)));
-        }
+    const add = (from: number, to: number): void => {
+      if (from >= to) { return; }
+      let ranges = byStyle.get(key);
+      if (!ranges) { ranges = []; byStyle.set(key, ranges); }
+      const startPosition = editor.document.positionAt(from);
+      const endPosition = editor.document.positionAt(to);
+      const previous = ranges[ranges.length - 1];
+      if (previous?.end.isEqual(startPosition)) {
+        ranges[ranges.length - 1] = new vscode.Range(previous.start, endPosition);
+      } else {
+        ranges.push(new vscode.Range(startPosition, endPosition));
       }
     };
     let cursor = start;
     for (const exclusion of exclusions) {
       if (exclusion.end <= cursor) { continue; }
       if (exclusion.start >= end) { break; }
-      if (exclusion.start > cursor) { addVisible(cursor, Math.min(end, exclusion.start)); }
+      if (exclusion.start > cursor) { add(cursor, Math.min(end, exclusion.start)); }
       cursor = Math.max(cursor, exclusion.end);
       if (cursor >= end) { return; }
     }
-    if (cursor < end) { addVisible(cursor, end); }
+    if (cursor < end) { add(cursor, end); }
   }
 
   private paint(editor: vscode.TextEditor, byStyle: Map<string, vscode.Range[]>, version: number): void {
     if (this.versions.get(editor) !== version || this.disposed) { return; }
     const current = new Set(byStyle.keys());
+    // Apply replacement colors before dropping older decoration types so a
+    // repaint never exposes the shell grammar's heredoc string color in between.
+    for (const [key, ranges] of byStyle) { editor.setDecorations(this.decorationFor(key), ranges); }
     for (const key of this.painted.get(editor) ?? []) {
       if (!current.has(key)) {
         const decoration = this.decorations.get(key);
         if (decoration) { editor.setDecorations(decoration, []); }
       }
     }
-    for (const [key, ranges] of byStyle) { editor.setDecorations(this.decorationFor(key), ranges); }
     this.painted.set(editor, current);
+    this.disposeUnusedDecorations();
+  }
+
+  private disposeUnusedDecorations(): void {
+    const active = new Set<string>();
+    for (const keys of this.painted.values()) {
+      for (const key of keys) { active.add(key); }
+    }
+    for (const [key, decoration] of this.decorations) {
+      if (!active.has(key)) {
+        decoration.dispose();
+        this.decorations.delete(key);
+        this.styles.delete(key);
+      }
+    }
   }
 
   private async semanticSegments(
     source: vscode.TextDocument, region: HeredocRegion, theme: ResolvedTheme,
-  ): Promise<SemanticSegment[]> {
+    isCurrent: () => boolean,
+  ): Promise<SemanticRender> {
     const lease = this.semanticUriForRegion?.(source, region);
-    if (!lease) { return []; }
+    if (!lease) { return { segments: [], retry: false }; }
     try {
       const uri = lease.uri;
       const setting = vscode.workspace.getConfiguration('editor', { uri, languageId: region.languageId })
         .get<boolean | 'configuredByTheme'>('semanticHighlighting.enabled', 'configuredByTheme');
-      if (setting === false || (setting !== true && !theme.semanticHighlighting)) { return []; }
-      const [legend, tokens] = await Promise.all([
-        vscode.commands.executeCommand<vscode.SemanticTokensLegend>(
-          'vscode.provideDocumentSemanticTokensLegend', uri),
-        vscode.commands.executeCommand<vscode.SemanticTokens>(
-          'vscode.provideDocumentSemanticTokens', uri),
-      ]);
-      if (!legend || !tokens?.data) { return []; }
+      if (setting === false || (setting !== true && !theme.semanticHighlighting)) {
+        return { segments: [], retry: false };
+      }
+      const key = uri.toString();
+      const sourceKey = source.uri.toString();
+      const sourceUris = this.semanticUrisBySource.get(sourceKey) ?? new Set<string>();
+      sourceUris.add(key);
+      this.semanticUrisBySource.set(sourceKey, sourceUris);
+      let cached = this.semanticCache.get(key);
+      if (!cached || cached.content !== region.content) {
+        cached = {
+          content: region.content,
+          result: Promise.all([
+            vscode.commands.executeCommand<vscode.SemanticTokensLegend>(
+              'vscode.provideDocumentSemanticTokensLegend', uri),
+            vscode.commands.executeCommand<vscode.SemanticTokens>(
+              'vscode.provideDocumentSemanticTokens', uri),
+          ]).then(([legend, tokens]) => legend && tokens?.data
+            ? { legend, data: tokens.data } : undefined).catch(error => {
+            this.output.appendLine(`Cannot read semantic tokens for ${region.languageId}: ${String(error)}`);
+            return undefined;
+          }),
+        };
+        this.semanticCache.set(key, cached);
+        while (this.semanticCache.size > 64) {
+          const oldest = this.semanticCache.keys().next().value;
+          if (oldest === undefined) { break; }
+          this.semanticCache.delete(oldest);
+        }
+      }
+      const snapshot = await cached.result;
+      if (!isCurrent()) { return { segments: [], retry: false }; }
+      if (!snapshot) {
+        if (this.semanticCache.get(key) === cached) { this.semanticCache.delete(key); }
+        return { segments: [], retry: true };
+      }
+      const { legend, data } = snapshot;
       const lineStarts = [0];
       for (let index = 0; index < region.content.length; index++) {
         if (region.content[index] === '\n') { lineStarts.push(index + 1); }
@@ -538,47 +738,97 @@ export class HeredocHighlighter implements vscode.Disposable {
           lineStarts.push(index + 1);
         }
       }
-      const segments: SemanticSegment[] = [];
+      const segments: StyledSegment[] = [];
+      const styleCache = new Map<string, Promise<DecorationStyle | undefined>>();
       let line = 0;
       let character = 0;
-      for (let index = 0; index + 4 < tokens.data.length; index += 5) {
-        line += tokens.data[index];
-        character = tokens.data[index] ? tokens.data[index + 1] : character + tokens.data[index + 1];
-        const type = legend.tokenTypes[tokens.data[index + 3]];
+      for (let index = 0; index + 4 < data.length; index += 5) {
+        if (index > 0 && index % 2500 === 0) {
+          await new Promise<void>(resolve => setImmediate(resolve));
+          if (!isCurrent()) { return { segments: [], retry: false }; }
+        }
+        line += data[index];
+        character = data[index] ? data[index + 1] : character + data[index + 1];
+        const type = legend.tokenTypes[data[index + 3]];
         if (!type || line >= lineStarts.length) { continue; }
+        const modifierMask = data[index + 4];
         const modifiers = new Set<string>();
         for (let bit = 0; bit < legend.tokenModifiers.length && bit < 32; bit++) {
-          if ((tokens.data[index + 4] & (1 << bit)) !== 0) {
+          if ((modifierMask & (1 << bit)) !== 0) {
             modifiers.add(legend.tokenModifiers[bit]);
           }
         }
-        const style = semanticAppearance(theme.semanticTokenColors, type, modifiers, region.languageId) ??
-          await this.grammars.semanticAppearance(region.languageId, type, modifiers, theme.hasBaseForeground);
+        const styleKey = `${type}\u0000${modifierMask}`;
+        let stylePromise = styleCache.get(styleKey);
+        if (!stylePromise) {
+          stylePromise = this.grammars.semanticAppearance(
+            region.languageId, type, modifiers, theme.hasBaseForeground,
+          ).then(fallback => resolveSemanticAppearance(
+            theme, type, modifiers, region.languageId, fallback,
+          ));
+          styleCache.set(styleKey, stylePromise);
+        }
+        const style = await stylePromise;
+        if (!isCurrent()) { return { segments: [], retry: false }; }
         if (!style) { continue; }
         const start = lineStarts[line] + character;
-        const end = start + tokens.data[index + 2];
+        const end = start + data[index + 2];
         const nextLine = line + 1 < lineStarts.length ? lineStarts[line + 1] : region.content.length;
         if (start >= 0 && end <= nextLine && end <= region.content.length) {
-          segments.push({ region, start, end, style });
+          segments.push({ start, end, style });
         }
       }
-      return segments;
+      return { segments, retry: false };
     } catch (error) {
-      this.output.appendLine(`Cannot read semantic tokens for ${region.languageId}: ${String(error)}`);
-      return [];
+      this.output.appendLine(`Cannot style semantic tokens for ${region.languageId}: ${String(error)}`);
+      return { segments: [], retry: false };
     } finally {
       lease.release();
     }
   }
 
+  private scheduleSemanticRetry(editor: vscode.TextEditor): void {
+    let retry = this.semanticRetries.get(editor);
+    if (!retry || retry.sourceVersion !== editor.document.version) {
+      retry = { sourceVersion: editor.document.version, attempts: 0 };
+      this.semanticRetries.set(editor, retry);
+    }
+    if (retry.timer || retry.attempts >= 3) { return; }
+    const delays = [700, 1800, 4000];
+    retry.timer = setTimeout(() => {
+      retry!.timer = undefined;
+      const request = this.requests.get(editor);
+      if (request && !editor.document.isClosed && editor.document.version === retry!.sourceVersion) {
+        void this.update(editor, request.regions);
+      }
+    }, delays[retry.attempts++]);
+  }
+
+  private clearSemanticRetry(editor: vscode.TextEditor): void {
+    const retry = this.semanticRetries.get(editor);
+    if (retry?.timer) { clearTimeout(retry.timer); }
+    this.semanticRetries.delete(editor);
+  }
+
+  private forgetSemanticSource(sourceKey: string): void {
+    for (const uri of this.semanticUrisBySource.get(sourceKey) ?? []) { this.semanticCache.delete(uri); }
+    this.semanticUrisBySource.delete(sourceKey);
+  }
+
   clear(editor: vscode.TextEditor): void {
     this.versions.set(editor, (this.versions.get(editor) ?? 0) + 1);
     this.requests.delete(editor);
+    this.clearSemanticRetry(editor);
+    const sourceKey = editor.document.uri.toString();
+    if (![...this.requests.keys()].some(other => other.document.uri.toString() === sourceKey)) {
+      this.forgetSemanticSource(sourceKey);
+    }
     for (const key of this.painted.get(editor) ?? []) {
       const decoration = this.decorations.get(key);
       if (decoration) { editor.setDecorations(decoration, []); }
     }
     this.painted.delete(editor);
+    this.disposeUnusedDecorations();
   }
 
   dispose(): void {
@@ -586,7 +836,6 @@ export class HeredocHighlighter implements vscode.Disposable {
     this.disposed = true;
     this.extensionListener.dispose();
     this.editorListener.dispose();
-    this.viewportListener.dispose();
     this.themeListener.dispose();
     this.configurationListener.dispose();
     for (const editor of new Set([...this.requests.keys(), ...this.painted.keys()])) {
@@ -595,6 +844,8 @@ export class HeredocHighlighter implements vscode.Disposable {
     for (const decoration of this.decorations.values()) { decoration.dispose(); }
     this.decorations.clear();
     this.styles.clear();
+    this.semanticCache.clear();
+    this.semanticUrisBySource.clear();
   }
 
   private decorationFor(key: string): vscode.TextEditorDecorationType {

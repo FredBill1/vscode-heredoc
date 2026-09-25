@@ -1,16 +1,12 @@
 import * as vscode from 'vscode';
 import * as textmate from 'vscode-textmate';
 import { parse as parseJsonc } from 'jsonc-parser';
+import { SemanticThemeRule, SemanticThemeRules, TokenAppearance } from './semanticTheme';
 
-export interface TokenAppearance {
-  readonly foreground?: string;
-  readonly bold?: boolean;
-  readonly italic?: boolean;
-  readonly underline?: boolean;
-  readonly strikethrough?: boolean;
-}
+export { resolveSemanticAppearance, semanticAppearance } from './semanticTheme';
+export type { TokenAppearance } from './semanticTheme';
 
-export interface ResolvedTheme {
+export interface ResolvedTheme extends SemanticThemeRules {
   readonly textmate: textmate.IRawTheme;
   readonly found: boolean;
   readonly hasBaseForeground: boolean;
@@ -29,6 +25,7 @@ interface ThemeContents {
   colors: Record<string, string>;
   tokenColors: textmate.IRawTheme['settings'];
   semanticTokenColors: Record<string, string | TokenAppearance>;
+  semanticTokenRuleEntries: SemanticThemeRule[];
   semanticHighlighting?: boolean;
 }
 
@@ -106,6 +103,21 @@ function semanticRules(value: unknown): Record<string, string | TokenAppearance>
   return rules;
 }
 
+function semanticRuleEntries(value: unknown): SemanticThemeRule[] {
+  return Object.entries(semanticRules(value)).map(([selector, appearance]) => ({ selector, appearance }));
+}
+
+function scopedSemanticRuleEntries(value: unknown, label: string): SemanticThemeRule[] {
+  const all = record(value);
+  const entries = semanticRuleEntries(all.rules);
+  for (const [key, scoped] of Object.entries(all)) {
+    if (key.startsWith('[') && [...key.matchAll(/\[([^\]]+)\]/g)].some(match => match[1] === label)) {
+      entries.push(...semanticRuleEntries(record(scoped).rules));
+    }
+  }
+  return entries;
+}
+
 function themeSpecific(value: unknown, label: string): Record<string, unknown> {
   const all = record(value);
   const selected: Record<string, unknown> = {};
@@ -153,6 +165,22 @@ function choiceForCurrentTheme(): { extension: vscode.Extension<unknown>; path: 
     ? { extension: selected.extension, path: selected.contribution.path } : undefined;
 }
 
+function tokenTypeSupertypes(): Record<string, string> {
+  // VS Code's built-in deprecated `member` token type inherits from `method`.
+  const superTypes: Record<string, string> = Object.create(null);
+  superTypes.member = 'method';
+  for (const extension of vscode.extensions.all) {
+    const contributions = extension.packageJSON?.contributes?.semanticTokenTypes;
+    if (!Array.isArray(contributions)) { continue; }
+    for (const contribution of contributions) {
+      if (typeof contribution?.id === 'string' && typeof contribution?.superType === 'string') {
+        superTypes[contribution.id] = contribution.superType;
+      }
+    }
+  }
+  return superTypes;
+}
+
 /** Read JSONC or TextMate plist themes, including inherited color themes. */
 export class ThemeLoader {
   constructor(private readonly output: vscode.OutputChannel) {}
@@ -162,7 +190,8 @@ export class ThemeLoader {
     const label = override?.label ?? vscode.workspace.getConfiguration('workbench').get<string>('colorTheme', '');
     let found = false;
     let contents: ThemeContents = {
-      colors: {}, tokenColors: [], semanticTokenColors: {}, semanticHighlighting: undefined,
+      colors: {}, tokenColors: [], semanticTokenColors: {}, semanticTokenRuleEntries: [],
+      semanticHighlighting: undefined,
     };
     if (selected || override) {
       const uri = override?.uri ?? vscode.Uri.joinPath(selected!.extension.extensionUri, selected!.path);
@@ -194,10 +223,15 @@ export class ThemeLoader {
     }
     settings.push(...tokenRules(tokenCustom.textMateRules));
     const hasBaseForeground = settings.some(rule => !rule.scope && color(rule.settings.foreground));
-    const semanticTokenColors = {
-      ...contents.semanticTokenColors,
-      ...semanticRules(semanticCustom.rules),
-    };
+    const semanticThemeRuleEntries = contents.semanticTokenRuleEntries;
+    const semanticUserRuleEntries = scopedSemanticRuleEntries(
+      vscode.workspace.getConfiguration('editor').get<unknown>('semanticTokenColorCustomizations'), label,
+    );
+    const semanticThemeColors = contents.semanticTokenColors;
+    const semanticUserColors = Object.fromEntries(semanticUserRuleEntries.map(
+      ({ selector, appearance }) => [selector, appearance],
+    ));
+    const semanticTokenColors = { ...semanticThemeColors, ...semanticUserColors };
     const semanticHighlighting = typeof semanticCustom.enabled === 'boolean'
       ? semanticCustom.enabled
       : typeof tokenCustom.semanticHighlighting === 'boolean'
@@ -209,6 +243,11 @@ export class ThemeLoader {
       hasBaseForeground,
       semanticHighlighting,
       semanticTokenColors,
+      semanticThemeColors,
+      semanticUserColors,
+      semanticThemeRuleEntries,
+      semanticUserRuleEntries,
+      semanticTokenTypeSupertypes: tokenTypeSupertypes(),
     };
   }
 
@@ -227,7 +266,8 @@ export class ThemeLoader {
       const theme = record(raw);
       if (!Object.keys(theme).length) { throw new Error(`Empty or invalid color theme: ${uri.toString()}`); }
       let base: ThemeContents = {
-        colors: {}, tokenColors: [], semanticTokenColors: {}, semanticHighlighting: undefined,
+        colors: {}, tokenColors: [], semanticTokenColors: {}, semanticTokenRuleEntries: [],
+        semanticHighlighting: undefined,
       };
       if (typeof theme.include === 'string') {
         base = await this.readTheme(vscode.Uri.joinPath(uri, '..', theme.include), seen);
@@ -243,6 +283,9 @@ export class ThemeLoader {
         colors: { ...base.colors, ...ownColors },
         tokenColors: [...base.tokenColors, ...fromFile],
         semanticTokenColors: { ...base.semanticTokenColors, ...semanticRules(theme.semanticTokenColors) },
+        semanticTokenRuleEntries: [
+          ...base.semanticTokenRuleEntries, ...semanticRuleEntries(theme.semanticTokenColors),
+        ],
         semanticHighlighting: typeof theme.semanticHighlighting === 'boolean'
           ? theme.semanticHighlighting : base.semanticHighlighting,
       };
@@ -262,32 +305,4 @@ export class ThemeLoader {
     const data = record(raw);
     return tokenRules(data.settings ?? data.tokenColors);
   }
-}
-
-function selectorScore(selector: string, type: string, modifiers: ReadonlySet<string>, languageId: string): number {
-  const match = /^([^.:]+)((?:\.[^.:]+)*)(?::(.+))?$/.exec(selector);
-  if (!match || (match[1] !== '*' && match[1] !== type) || (match[3] && match[3] !== languageId)) {
-    return -1;
-  }
-  const needed = match[2].split('.').filter(Boolean);
-  if (needed.some(modifier => !modifiers.has(modifier))) { return -1; }
-  return (match[1] === type ? 1000 : 0) + needed.length * 100 + (match[3] ? 10 : 0);
-}
-
-export function semanticAppearance(
-  rules: Readonly<Record<string, string | TokenAppearance>>,
-  type: string,
-  modifiers: ReadonlySet<string>,
-  languageId: string,
-): TokenAppearance | undefined {
-  let bestScore = -1;
-  let best: string | TokenAppearance | undefined;
-  for (const [selector, appearance] of Object.entries(rules)) {
-    const score = selectorScore(selector, type, modifiers, languageId);
-    if (score >= 0 && score >= bestScore) {
-      bestScore = score;
-      best = appearance;
-    }
-  }
-  return typeof best === 'string' ? { foreground: best } : best;
 }

@@ -7,6 +7,7 @@ async function main(): Promise<void> {
   const extensionDevelopmentPath = path.resolve(__dirname, '../../');
   const extensionTestsPath = path.resolve(__dirname, './suite/live.test');
   const installed = process.env.HEREDOC_EXTENSIONS_DIR ?? path.join(os.homedir(), '.vscode', 'extensions');
+  const useInstalledExtensions = process.env.HEREDOC_LIVE_ALL_EXTENSIONS === '1';
   const selected = path.join(extensionDevelopmentPath, '.vscode-test', 'live-extensions');
   const userData = path.join(extensionDevelopmentPath, '.vscode-test', 'live-user-data');
   await fs.mkdir(selected, { recursive: true });
@@ -21,21 +22,23 @@ async function main(): Promise<void> {
     'ms-python.vscode-python-envs-', 'ms-python.debugpy-',
     'redhat.vscode-yaml-', 'mads-hartmann.bash-ide-vscode-',
   ];
-  const entries = await fs.readdir(installed, { withFileTypes: true });
-  for (const entry of entries) {
-    if (!entry.isDirectory() || !wanted.some(prefix => entry.name.startsWith(prefix))) continue;
-    const link = path.join(selected, entry.name);
-    try {
-      await fs.symlink(path.join(installed, entry.name), link, process.platform === 'win32' ? 'junction' : 'dir');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  if (!useInstalledExtensions) {
+    const entries = await fs.readdir(installed, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !wanted.some(prefix => entry.name.startsWith(prefix))) continue;
+      const link = path.join(selected, entry.name);
+      try {
+        await fs.symlink(path.join(installed, entry.name), link, process.platform === 'win32' ? 'junction' : 'dir');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
     }
   }
   await runTests({
     extensionDevelopmentPath,
     extensionTestsPath,
     launchArgs: [
-      `--extensions-dir=${selected}`, `--user-data-dir=${userData}`,
+      `--extensions-dir=${useInstalledExtensions ? installed : selected}`, `--user-data-dir=${userData}`,
       '--disable-updates', '--skip-welcome', '--skip-release-notes',
     ],
     ...(process.env.VSCODE_EXECUTABLE_PATH

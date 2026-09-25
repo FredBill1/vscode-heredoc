@@ -151,7 +151,6 @@ class HeredocExtension implements vscode.Disposable {
         this.refresh(state.document);
       }
     }));
-    this.disposables.push(vscode.window.onDidChangeActiveColorTheme(() => this.refreshVisibleHighlighting()));
     this.disposables.push(vscode.window.onDidChangeVisibleTextEditors(() => this.refreshVisibleHighlighting()));
     this.disposables.push(vscode.languages.onDidChangeDiagnostics(event => {
       const affected = new Set<string>();

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import * as vscode from 'vscode';
+import { GrammarLibrary } from '../../highlighting';
+import { ThemeLoader } from '../../theme';
 
 function wait(ms: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, ms)); }
 
@@ -91,6 +93,52 @@ async function probe(
   }));
 }
 
+async function inspectLiveThemes(): Promise<void> {
+  const output = vscode.window.createOutputChannel('Heredoc live theme test');
+  const loader = new ThemeLoader(output);
+  const grammars = new GrammarLibrary(output);
+  const workbench = vscode.workspace.getConfiguration('workbench');
+  const previousTheme = workbench.inspect<string>('colorTheme')?.globalValue;
+  const themeExtensions = vscode.extensions.all.filter(extension =>
+    Array.isArray(extension.packageJSON?.contributes?.themes) &&
+    extension.packageJSON.contributes.themes.some((theme: { label?: string }) => theme.label === 'LimeGray'));
+  console.log('LIVE LimeGray theme contributions', themeExtensions.map(extension => extension.id));
+  const hasLimeGray = themeExtensions.length > 0;
+  const labels = hasLimeGray ? ['LimeGray', 'Dark+', 'Light+'] : ['Dark+', 'Light+'];
+  try {
+    for (const label of labels) {
+      await workbench.update('colorTheme', label, vscode.ConfigurationTarget.Global);
+      const theme = await loader.load();
+      assert.ok(theme.found, `${label} contribution resolves as the active theme`);
+      grammars.setTheme(theme.textmate);
+      for (const [language, line] of [
+        ['python', 'print("hello")'],
+        ['yaml', 'name: "hello"'],
+        ['typescript', 'const value = "hello";'],
+      ] as const) {
+        const grammar = await grammars.forLanguage(language);
+        assert.ok(grammar, `${language} grammar available with ${label}`);
+        const tokens = grammar.tokenizeLine2(line, null).tokens;
+        const offset = line.indexOf('hello');
+        let metadata = tokens[1];
+        for (let index = 0; index < tokens.length; index += 2) {
+          if (tokens[index] > offset) { break; }
+          metadata = tokens[index + 1];
+        }
+        const color = grammars.getColorMap()[(metadata >>> 15) & 0x1ff];
+        assert.ok(color?.startsWith('#'), `${label} ${language} string has a theme color`);
+        if (label === 'LimeGray') {
+          assert.equal(color.toLowerCase(), '#d0ff00', `${language} uses LimeGray string color`);
+        }
+      }
+      console.log('LIVE THEME', label, 'Python/YAML/TypeScript grammar colors resolved');
+    }
+  } finally {
+    await workbench.update('colorTheme', previousTheme, vscode.ConfigurationTarget.Global);
+    output.dispose();
+  }
+}
+
 export async function run(): Promise<void> {
   const targetIds = [
     'ms-python.python', 'ms-python.vscode-pylance',
@@ -119,6 +167,7 @@ export async function run(): Promise<void> {
     ], vscode.ConfigurationTarget.Global);
     await probe('YAMLFILE', 'yaml', 'fileprobe: [1, 2', 0, 13, 'file');
     await probe('SH', 'shellscript', 'echo hel', 0, 8, 'file');
+    await inspectLiveThemes();
   } finally {
     await settings.update('rules', previousRules, vscode.ConfigurationTarget.Global);
     await settings.update('enablePresets', previousPresets, vscode.ConfigurationTarget.Global);

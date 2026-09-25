@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { GrammarLibrary } from '../../highlighting';
 import { deactivate } from '../../extension';
+import { parseHeredocs } from '../../parser';
+import { ShadowManager } from '../../shadow';
+import { run as runThemeTests } from './theme.test';
 
 const completionLabel = 'HEREDOC_MOCK_COMPLETION';
 const hoverText = 'HEREDOC_MOCK_HOVER';
@@ -88,7 +94,7 @@ function registerMockProviders(state: MockState, diagnostics: vscode.DiagnosticC
       provideCompletionItems: (document, position) => {
         state.calls++;
         state.shadowUri = document.uri;
-        assert.equal(document.lineAt(0).text, 'alpha');
+        assert.match(document.lineAt(0).text, /^alpha/);
         const item = new vscode.CompletionItem(completionLabel, vscode.CompletionItemKind.Text);
         item.range = new vscode.Range(0, 0, 0, 5);
         item.insertText = 'replacement';
@@ -130,17 +136,28 @@ export async function run(): Promise<void> {
   const settings = vscode.workspace.getConfiguration('heredoc');
   const previousRules = settings.inspect<unknown[]>('rules')?.globalValue;
   const previousPresets = settings.inspect<boolean>('enablePresets')?.globalValue;
+  const fileSettings = vscode.workspace.getConfiguration('files');
+  const previousAutoSave = fileSettings.inspect<string>('autoSave')?.globalValue;
+  const previousAutoSaveDelay = fileSettings.inspect<number>('autoSaveDelay')?.globalValue;
   const mockState: MockState = { calls: 0 };
   const mockDiagnostics = vscode.languages.createDiagnosticCollection('heredoc-host-mock');
   const disposables = registerMockProviders(mockState, mockDiagnostics);
+  const shadowSaveEvents: vscode.Uri[] = [];
+  disposables.push(vscode.workspace.onDidSaveTextDocument(document => {
+    if (document.uri.scheme === 'file' && document.uri.path.includes('/shadow/')) {
+      shadowSaveEvents.push(document.uri);
+    }
+  }));
 
   try {
     await settings.update('enablePresets', true, vscode.ConfigurationTarget.Global);
+    await fileSettings.update('autoSave', 'afterDelay', vscode.ConfigurationTarget.Global);
+    await fileSettings.update('autoSaveDelay', 200, vscode.ConfigurationTarget.Global);
     await settings.update('rules', [
       { pattern: 'MOCK', languageId: 'plaintext', documentMode: 'virtual' },
     ], vscode.ConfigurationTarget.Global);
 
-    const extension = vscode.extensions.getExtension('vscode-heredoc-local.vscode-heredoc');
+    const extension = vscode.extensions.getExtension('fredbill1.vscode-heredoc');
     assert.ok(extension, 'development extension is available');
     await extension.activate();
     assert.equal(vscode.extensions.getExtension('ms-python.python'), undefined,
@@ -256,7 +273,7 @@ export async function run(): Promise<void> {
       values => !hasMockCompletion(values),
     );
 
-    console.log('host: file shadows avoid unchanged writes and are removed with their rule');
+    console.log('host: file shadows are immutable, clean, and removed with their rule');
     await settings.update('rules', [
       { pattern: 'FILEMOCK', languageId: 'plaintext', documentMode: 'file' },
     ], vscode.ConfigurationTarget.Global);
@@ -272,23 +289,43 @@ export async function run(): Promise<void> {
     const fileShadowUri = mockState.shadowUri;
     assert.ok(fileShadowUri);
     assert.equal(fileShadowUri.scheme, 'file');
+    const initialShadowDocument = vscode.workspace.textDocuments.find(document =>
+      document.uri.toString() === fileShadowUri.toString());
+    assert.ok(initialShadowDocument && !initialShadowDocument.isDirty, 'initial file shadow is clean');
     const firstStat = await vscode.workspace.fs.stat(fileShadowUri);
     await completionItems(fileSource, new vscode.Position(1, 2));
     const secondStat = await vscode.workspace.fs.stat(fileShadowUri);
     assert.equal(secondStat.mtime, firstStat.mtime, 'unchanged content does not rewrite the file');
+    assert.equal(mockState.shadowUri?.toString(), fileShadowUri.toString(), 'unchanged content reuses its URI');
     const firstEdit = new vscode.WorkspaceEdit();
     firstEdit.replace(fileSource.uri, new vscode.Range(1, 0, 1, 5), 'alphaX');
     assert.ok(await vscode.workspace.applyEdit(firstEdit));
     const secondEdit = new vscode.WorkspaceEdit();
     secondEdit.replace(fileSource.uri, new vscode.Range(2, 0, 2, 4), 'betaY');
     assert.ok(await vscode.workspace.applyEdit(secondEdit));
-    await eventually(
-      'rapid source edits reach the same shadow file',
-      async () => Buffer.from(await vscode.workspace.fs.readFile(fileShadowUri)).toString('utf8'),
-      value => value === 'alphaX\nbetaY\n',
+    const updatedShadowUri = await eventually(
+      'rapid source edits use a new immutable snapshot',
+      async () => {
+        await completionItems(fileSource, new vscode.Position(1, 2));
+        const uri = mockState.shadowUri;
+        if (!uri || uri.toString() === fileShadowUri.toString() || !(await exists(uri))) return undefined;
+        const content = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+        return content === 'alphaX\nbetaY\n' ? uri : undefined;
+      },
+      value => value !== undefined,
     );
+    assert.ok(updatedShadowUri);
+    if (await exists(fileShadowUri)) {
+      assert.equal(Buffer.from(await vscode.workspace.fs.readFile(fileShadowUri)).toString('utf8'),
+        'alpha\nbeta\n', 'older snapshot is never edited');
+    }
+    await pause(600);
+    assert.equal(shadowSaveEvents.length, 0, 'auto save never saves a file shadow');
+    assert.ok(vscode.workspace.textDocuments.filter(document =>
+      document.uri.scheme === 'file' && document.uri.path.includes('/shadow/')).every(document => !document.isDirty),
+    'all open file shadows remain clean after rapid edits');
     await settings.update('rules', [], vscode.ConfigurationTarget.Global);
-    await eventually('file shadow removed after rule change', () => exists(fileShadowUri), value => !value);
+    await eventually('latest file shadow removed after rule change', () => exists(updatedShadowUri), value => !value);
 
     console.log('host: deactivation removes remaining file shadows');
     await settings.update('rules', [
@@ -306,10 +343,43 @@ export async function run(): Promise<void> {
     assert.ok(shutdownShadow && await exists(shutdownShadow));
     await deactivate();
     await eventually('file shadow removed at deactivation', () => exists(shutdownShadow), value => !value);
+
+    console.log('host: separate extension instances use distinct file paths');
+    const sessionRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'heredoc-session-test-'));
+    const sessionContext = {
+      storageUri: vscode.Uri.file(sessionRoot),
+      globalStorageUri: vscode.Uri.file(sessionRoot),
+    } as vscode.ExtensionContext;
+    const sessionOutput = vscode.window.createOutputChannel('Heredoc session test');
+    try {
+      const region = parseHeredocs(fileSource.getText(), () => 'plaintext')[0];
+      assert.ok(region);
+      const firstManager = new ShadowManager(sessionContext, sessionOutput);
+      const first = await firstManager.ensure(fileSource, region, 'file');
+      assert.ok(first);
+      const lease = firstManager.pinCurrent(fileSource, region);
+      assert.ok(lease, 'current snapshot can be leased for semantic tokens');
+      await firstManager.releaseSource(fileSource.uri);
+      assert.equal(await exists(first.uri), true, 'retired snapshot remains while a request uses it');
+      lease.release();
+      await eventually('leased snapshot removed after request', () => exists(first.uri), value => !value);
+      await firstManager.shutdown();
+      const secondManager = new ShadowManager(sessionContext, sessionOutput);
+      const second = await secondManager.ensure(fileSource, region, 'file');
+      assert.ok(second);
+      assert.notEqual(first.uri.toString(), second.uri.toString(), 'sessions cannot share a file path');
+      await secondManager.shutdown();
+    } finally {
+      sessionOutput.dispose();
+      await fs.rm(sessionRoot, { recursive: true, force: true });
+    }
+    await runThemeTests();
   } finally {
     for (const disposable of disposables) disposable.dispose();
     mockDiagnostics.dispose();
     await settings.update('rules', previousRules, vscode.ConfigurationTarget.Global);
     await settings.update('enablePresets', previousPresets, vscode.ConfigurationTarget.Global);
+    await fileSettings.update('autoSave', previousAutoSave, vscode.ConfigurationTarget.Global);
+    await fileSettings.update('autoSaveDelay', previousAutoSaveDelay, vscode.ConfigurationTarget.Global);
   }
 }

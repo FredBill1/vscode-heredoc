@@ -33,6 +33,9 @@ async function probe(
   );
   assert.ok(shadow, `${label} shadow document was created`);
   assert.equal(shadow.uri.scheme, scheme, `${label} uses ${scheme}: shadow`);
+  if (scheme === 'file') {
+    assert.equal(shadow.isDirty, false, `${label} file snapshot stays clean`);
+  }
 
   const sourcePosition = new vscode.Position(line + 1, character);
   const shadowPosition = new vscode.Position(line, character);
@@ -98,7 +101,7 @@ export async function run(): Promise<void> {
     id, installed: !!vscode.extensions.getExtension(id),
     active: vscode.extensions.getExtension(id)?.isActive,
   }))));
-  const ours = vscode.extensions.getExtension('vscode-heredoc-local.vscode-heredoc');
+  const ours = vscode.extensions.getExtension('fredbill1.vscode-heredoc');
   assert.ok(ours);
   await ours.activate();
 

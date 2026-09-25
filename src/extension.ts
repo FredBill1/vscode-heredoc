@@ -3,13 +3,19 @@ import { HeredocHighlighter } from './highlighting';
 import { RegionMapper, findInnermostRegion } from './mapping';
 import { HeredocRegion, parseHeredocs } from './parser';
 import { DocumentMode, RuleResolver } from './rules';
-import { ShadowDocument, ShadowManager } from './shadow';
+import { ShadowDocument, ShadowLease, ShadowManager } from './shadow';
 
 interface SourceState {
   document: vscode.TextDocument;
   version: number;
   regions: HeredocRegion[];
   resolver: RuleResolver;
+}
+
+interface ResolvedRequest {
+  lease: ShadowLease;
+  mapper: RegionMapper;
+  sourceVersion: number;
 }
 
 const DISALLOWED_SHELL_SUFFIX = /\.(?:fish|zsh|zshrc|zprofile|zlogin|zlogout|zshenv|ksh|csh|tcsh|yash)$/i;
@@ -112,7 +118,10 @@ class HeredocExtension implements vscode.Disposable {
 
   constructor(private readonly context: vscode.ExtensionContext) {
     this.shadows = new ShadowManager(context, this.output);
-    this.highlighter = new HeredocHighlighter(context, this.output);
+    this.highlighter = new HeredocHighlighter(context, this.output, (source, region) => {
+      const lease = this.shadows.pinCurrent(source, region);
+      return lease ? { uri: lease.shadow.uri, release: lease.release } : undefined;
+    });
     this.disposables.push(this.output, this.diagnostics, this.shadows, this.highlighter);
   }
 
@@ -170,22 +179,27 @@ class HeredocExtension implements vscode.Disposable {
         if (!resolved) {
           return undefined;
         }
-        const { shadow, mapper } = resolved;
-        const embeddedPosition = mapper.toEmbedded(position);
-        if (!embeddedPosition) {
-          return undefined;
+        const { lease, mapper, sourceVersion } = resolved;
+        const { shadow } = lease;
+        try {
+          const embeddedPosition = mapper.toEmbedded(position);
+          if (!embeddedPosition) {
+            return undefined;
+          }
+          const list = await vscode.commands.executeCommand<vscode.CompletionList>(
+            'vscode.executeCompletionItemProvider', shadow.uri, embeddedPosition, context.triggerCharacter,
+          );
+          if (token.isCancellationRequested || document.version !== sourceVersion || !list) {
+            return undefined;
+          }
+          const items = list.items.flatMap(item => {
+            const mapped = cloneCompletion(item, mapper);
+            return mapped ? [mapped] : [];
+          });
+          return new vscode.CompletionList(items, list.isIncomplete);
+        } finally {
+          lease.release();
         }
-        const list = await vscode.commands.executeCommand<vscode.CompletionList>(
-          'vscode.executeCompletionItemProvider', shadow.uri, embeddedPosition, context.triggerCharacter,
-        );
-        if (token.isCancellationRequested || document.version !== shadow.sourceVersion || !list) {
-          return undefined;
-        }
-        const items = list.items.flatMap(item => {
-          const mapped = cloneCompletion(item, mapper);
-          return mapped ? [mapped] : [];
-        });
-        return new vscode.CompletionList(items, list.isIncomplete);
       },
     }, '.', ':', '/', '@', '$', '-'));
 
@@ -195,23 +209,28 @@ class HeredocExtension implements vscode.Disposable {
         if (!resolved) {
           return undefined;
         }
-        const { shadow, mapper } = resolved;
-        const embeddedPosition = mapper.toEmbedded(position);
-        if (!embeddedPosition) {
-          return undefined;
+        const { lease, mapper, sourceVersion } = resolved;
+        const { shadow } = lease;
+        try {
+          const embeddedPosition = mapper.toEmbedded(position);
+          if (!embeddedPosition) {
+            return undefined;
+          }
+          const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+            'vscode.executeHoverProvider', shadow.uri, embeddedPosition,
+          );
+          if (token.isCancellationRequested || document.version !== sourceVersion || !hovers?.length) {
+            return undefined;
+          }
+          const contents = hovers.flatMap(hover => hover.contents);
+          const range = hovers.find(hover => hover.range)?.range;
+          const mappedRange = range ? mapper.toSourceRange(range) : undefined;
+          return mappedRange && mapper.withinBody(mappedRange)
+            ? new vscode.Hover(contents, mappedRange)
+            : new vscode.Hover(contents);
+        } finally {
+          lease.release();
         }
-        const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
-          'vscode.executeHoverProvider', shadow.uri, embeddedPosition,
-        );
-        if (token.isCancellationRequested || document.version !== shadow.sourceVersion || !hovers?.length) {
-          return undefined;
-        }
-        const contents = hovers.flatMap(hover => hover.contents);
-        const range = hovers.find(hover => hover.range)?.range;
-        const mappedRange = range ? mapper.toSourceRange(range) : undefined;
-        return mappedRange && mapper.withinBody(mappedRange)
-          ? new vscode.Hover(contents, mappedRange)
-          : new vscode.Hover(contents);
       },
     }));
 
@@ -221,21 +240,26 @@ class HeredocExtension implements vscode.Disposable {
         if (!resolved) {
           return undefined;
         }
-        const { shadow, mapper } = resolved;
-        const embeddedPosition = mapper.toEmbedded(position);
-        if (!embeddedPosition) {
-          return undefined;
+        const { lease, mapper, sourceVersion } = resolved;
+        const { shadow } = lease;
+        try {
+          const embeddedPosition = mapper.toEmbedded(position);
+          if (!embeddedPosition) {
+            return undefined;
+          }
+          const locations = await vscode.commands.executeCommand<(vscode.Location | vscode.LocationLink)[]>(
+            'vscode.executeDefinitionProvider', shadow.uri, embeddedPosition,
+          );
+          if (token.isCancellationRequested || document.version !== sourceVersion || !locations) {
+            return undefined;
+          }
+          return locations.flatMap(location => {
+            const mapped = mapLocation(location, shadow, mapper);
+            return mapped ? [mapped] : [];
+          });
+        } finally {
+          lease.release();
         }
-        const locations = await vscode.commands.executeCommand<(vscode.Location | vscode.LocationLink)[]>(
-          'vscode.executeDefinitionProvider', shadow.uri, embeddedPosition,
-        );
-        if (token.isCancellationRequested || document.version !== shadow.sourceVersion || !locations) {
-          return undefined;
-        }
-        return locations.flatMap(location => {
-          const mapped = mapLocation(location, shadow, mapper);
-          return mapped ? [mapped] : [];
-        });
       },
     }));
   }
@@ -244,10 +268,11 @@ class HeredocExtension implements vscode.Disposable {
     document: vscode.TextDocument,
     position: vscode.Position,
     token: vscode.CancellationToken,
-  ): Promise<{ shadow: ShadowDocument; mapper: RegionMapper } | undefined> {
+  ): Promise<ResolvedRequest | undefined> {
     if (!isSupportedShell(document, this.shadows) || token.isCancellationRequested) {
       return undefined;
     }
+    const sourceVersion = document.version;
     const state = this.currentState(document);
     const region = findInnermostRegion(state.regions, document.offsetAt(position));
     if (!region) {
@@ -257,11 +282,17 @@ class HeredocExtension implements vscode.Disposable {
     if (!rule) {
       return undefined;
     }
-    const shadow = await this.shadows.ensure(document, region, rule.documentMode);
-    if (!shadow || token.isCancellationRequested || shadow.sourceVersion !== document.version) {
+    const lease = await this.shadows.acquire(document, region, rule.documentMode, token);
+    if (!lease) {
       return undefined;
     }
-    return { shadow, mapper: new RegionMapper(document, shadow.document, region) };
+    const { shadow } = lease;
+    if (token.isCancellationRequested || document.version !== sourceVersion ||
+      shadow.sourceVersion !== sourceVersion) {
+      lease.release();
+      return undefined;
+    }
+    return { lease, mapper: new RegionMapper(document, shadow.document, region), sourceVersion };
   }
 
   private currentState(document: vscode.TextDocument): SourceState {
@@ -316,6 +347,7 @@ class HeredocExtension implements vscode.Disposable {
       await this.shadows.reconcile(state.document, state.regions, modeFor);
       if (this.states.get(key) === state) {
         this.refreshDiagnostics(key);
+        this.updateEditorHighlighting(state);
       }
     }, 250));
   }

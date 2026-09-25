@@ -1,0 +1,103 @@
+{
+  "name": "vscode-heredoc",
+  "displayName": "Heredoc Embedded Languages",
+  "description": "Embedded language highlighting and language features inside shell heredocs",
+  "version": "0.0.1",
+  "publisher": "fredbill1",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FredBill1/vscode-heredoc"
+  },
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "shell",
+    "bash",
+    "heredoc",
+    "embedded languages"
+  ],
+  "main": "./dist/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onLanguage:shellscript"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "Heredoc Embedded Languages",
+      "properties": {
+        "heredoc.enablePresets": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用预设的 heredoc delimiter 与语言对应规则。用户规则始终优先。"
+        },
+        "heredoc.rules": {
+          "type": "array",
+          "default": [],
+          "description": "按顺序匹配的自定义规则。pattern 必须匹配去除 shell 引用后的完整 delimiter；命中后使用 languageId 指定的已注册 VS Code 语言。",
+          "items": {
+            "type": "object",
+            "required": [
+              "pattern",
+              "languageId"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "pattern": {
+                "type": "string",
+                "description": "JavaScript 正则表达式模式，按完整 delimiter 匹配。"
+              },
+              "languageId": {
+                "type": "string",
+                "minLength": 1,
+                "description": "目标语言的 VS Code languageId，例如 python、yaml、shellscript、typescript。"
+              },
+              "flags": {
+                "type": "string",
+                "default": "",
+                "description": "可选的 JavaScript 正则表达式标志，例如 i。"
+              },
+              "documentMode": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "virtual",
+                  "untitled",
+                  "file"
+                ],
+                "default": "auto",
+                "description": "为目标语言扩展提供正文的临时文档方式；auto 对 Bash IDE 和 Pylance 使用 file，对其他语言优先使用内存文档。"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "test:host": "npm run build && node ./dist/test/runTest.js",
+    "test:live": "npm run build && node ./dist/test/runLive.js",
+    "package": "vsce package --out vscode-heredoc.vsix",
+    "vscode:prepublish": "npm run build"
+  },
+  "dependencies": {
+    "vscode-oniguruma": "^2.0.1",
+    "vscode-textmate": "^9.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.95.0",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^4.0.0",
+    "typescript": "~5.9.3"
+  }
+}

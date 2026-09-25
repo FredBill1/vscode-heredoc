@@ -1,0 +1,12 @@
+.git/**
+.gitignore
+.github/**
+.vscode/**
+.vscode-test/**
+src/**
+dist/test/**
+syntaxes/**
+**/*.map
+tsconfig.json
+*.vsix
+*.log

@@ -1,0 +1,75 @@
+# Heredoc Embedded Languages
+
+在 sh/Bash 的 `shellscript` 文件中，根据 heredoc 的 delimiter 为正文添加嵌入语言高亮，并尝试复用已安装语言扩展的补全、悬停、定义和诊断。普通 shell 代码继续由现有的 shell 语法和扩展处理；本扩展不会自动安装或启用其他扩展。
+
+## 快速开始
+
+运行 `npm run package` 后，可用 `code --install-extension vscode-heredoc.vsix` 安装生成的 VSIX。打开 Bash 脚本，输入：
+
+```sh
+python3 <<'PY'
+print('hello from Python')
+PY
+```
+
+`PY` 会映射为 VS Code 的 `python` 语言。可在 [`examples/example.sh`](examples/example.sh) 查看 YAML、TypeScript、多个 heredoc 和嵌套 shell 示例。可选的语言扩展包括 Python 的 `ms-python.python`、YAML 的 `redhat.vscode-yaml` 和 shell 的 `mads-hartmann.bash-ide-vscode`；TypeScript 使用 VS Code 自带的语言支持。即使对应扩展缺席或禁用，也会尽可能保留语法高亮。
+
+## Delimiter 规则
+
+预设规则不区分大小写，覆盖以下 14 类语言：
+
+| 语言       | Delimiter             | `languageId`  |
+| ---------- | --------------------- | ------------- |
+| Python     | `PY`, `PYTHON`        | `python`      |
+| YAML       | `YML`, `YAML`         | `yaml`        |
+| Shell      | `SH`, `SHELL`, `BASH` | `shellscript` |
+| TypeScript | `TS`, `TYPESCRIPT`    | `typescript`  |
+| JavaScript | `JS`, `JAVASCRIPT`    | `javascript`  |
+| JSON       | `JSON`                | `json`        |
+| SQL        | `SQL`                 | `sql`         |
+| HTML       | `HTML`, `HTM`         | `html`        |
+| CSS        | `CSS`                 | `css`         |
+| XML        | `XML`                 | `xml`         |
+| Markdown   | `MD`, `MARKDOWN`      | `markdown`    |
+| Ruby       | `RB`, `RUBY`          | `ruby`        |
+| Go         | `GO`, `GOLANG`        | `go`          |
+| Rust       | `RS`, `RUST`          | `rust`        |
+
+可在 `settings.json` 中添加自定义规则：
+
+```jsonc
+{
+  "heredoc.rules": [
+    {
+      "pattern": "CONFIG|SETTINGS",
+      "languageId": "yaml",
+      "flags": "i",
+      "documentMode": "auto"
+    },
+    {
+      "pattern": "PY",
+      "languageId": "javascript"
+    }
+  ],
+  "heredoc.enablePresets": true
+}
+```
+
+自定义规则按数组顺序匹配，优先于预设；第二条规则会覆盖预设的 `PY`。正则表达式必须匹配**整个** delimiter，匹配前会移除 shell 引用，因此 `<<'PY'`、`<<"PY"` 和 `<<P'Y'` 都以 `PY` 匹配。`languageId` 必须是当前 VS Code 中已注册的语言 ID；扩展不会从 delimiter、文件内容或命令名自动猜测其他语言。将 `heredoc.enablePresets` 设为 `false` 可只使用自定义规则。
+
+`documentMode` 可选 `auto`（默认）、`virtual`、`untitled` 或 `file`。它控制语言服务看到的临时文档形式。`auto` 优先使用虚拟内存文档；已知需要 `file:` URI 的 Bash IDE 与 Pylance 使用扩展存储目录中的临时文件。需要特定 URI 形式的语言扩展可以通过规则指定模式。显式指定 `untitled` 可能在当前会话中留下未保存文档。
+
+## 行为和限制
+
+- 扩展仅处理 `shellscript` 文档中的 sh/Bash heredoc，不处理已识别为 zsh、fish 等方言的文档。正文外的 shell 代码不受本扩展改动。
+- 支持 `<<`、`<<-`、引用与混合引用的 delimiter、同一行的多个 heredoc，以及映射为 shell 的 heredoc 正文中的嵌套 heredoc。`<<-` 仅忽略用于结束 delimiter 和正文的前置 TAB，不忽略空格；未引用 delimiter 的正文按 Bash 规则在判断结束行前处理反斜杠续行。
+- 所有规则均由 shell 解析器确定正文边界，再通过目标语言的 TextMate 语法和编辑器装饰即时着色。这让着色只作用于 sh/Bash 文档中的正文；静态 TextMate 注入无法按文档方言限制。主题颜色是近似值，可能与目标语言在独立文件中的原生配色存在差异。
+- 补全、悬停、定义和诊断取决于目标扩展是否安装、启用并支持临时文档。扩展会转发语言请求并映射位置；诊断只能监听目标扩展主动发布的结果，不能强制其运行。部分扩展可能只对真实文件工作，此时可尝试 `documentMode: "file"`。
+- VS Code 不提供将转发请求独占交给某一扩展的接口，也不能阻止原有 shell 扩展在正文内返回结果。因此多个提供者的补全或诊断可能同时出现。
+- 未引用的 heredoc 正文会按原始文本送给语言服务；脚本运行时可能发生的变量、命令或算术展开不会被预先求值。
+
+## 开发与打包
+
+需要 Node.js 和 npm。运行 `npm install` 后，使用 `npm run build` 编译、`npm test` 执行单元测试、`npm run test:host` 启动隔离的 VS Code 扩展宿主测试、`npm run package` 生成 VSIX。按 `F5` 可在扩展开发宿主中打开 `examples` 目录。
+
+本机已安装 Python/Pylance、YAML 和 Bash IDE 时，可运行 `npm run test:live`。该测试在 `.vscode-test` 中创建独立配置目录，仅链接这些已安装扩展，并联调它们和 VS Code 内置 TypeScript 的补全及 YAML 诊断。可用 `HEREDOC_EXTENSIONS_DIR` 指定扩展安装目录。目标扩展缺席时仍可用 `npm run test:host` 验证内置 Python grammar 可加载，支持高亮回退。
